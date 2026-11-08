@@ -31,6 +31,30 @@ unidecomp <file> --disasm --va 0x401000 --size 0x400 --arch x86-64
 unidecomp <file> --json          # machine-readable output
 ```
 
+## Full decompilation (Ghidra engine)
+
+```bash
+unidecomp --install-engine          # one-time: downloads Ghidra (Apache-2.0, NSA)
+unidecomp <file> --decompile        # headless analysis -> <file>.decompiled.c
+unidecomp <file> --decompile -o out.c
+```
+
+`--decompile` runs Ghidra's full auto-analysis (disassembly, function
+recovery, decompiler) and exports C pseudocode for every function — the
+same engine used by NSA professionals. Requires **JDK 21+** (auto-detected;
+install Temurin JDK 21 if missing). Ghidra is downloaded on demand to
+`%LOCALAPPDATA%\UniDecomp\engines` — UniDecomp itself stays small.
+
+## Legal notice
+
+UniDecomp and the Ghidra engine are lawful tools. You may only analyze
+binaries you own or have the legal right to examine — your own software,
+open-source code, malware you're authorized to analyze defensively, or
+files covered by reverse-engineering-for-interoperability exemptions in
+your jurisdiction (e.g., DMCA §1201(f) in the US). Do not use it to
+circumvent copy protection, DRM, or anti-tamper mechanisms, and do not
+decompile proprietary software you have no rights to.
+
 ## Deeper decompilation
 
 UniDecomp handles *analysis*; for full source-level decompilation pair it

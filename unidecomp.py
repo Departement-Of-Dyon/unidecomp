@@ -29,7 +29,7 @@ Supported: PE/COFF (.exe/.dll, incl. .NET), ELF, Mach-O (incl. fat),
 Java .class, Python .pyc, Android .dex/.apk, Lua bytecode, WebAssembly,
 raw firmware/binaries.
 """
-import argparse, datetime, hashlib, io, json, math, os, struct, sys, zipfile
+import argparse, datetime, glob, hashlib, io, json, math, os, struct, subprocess, sys, tempfile, urllib.request, zipfile
 from pathlib import Path
 
 try:
@@ -734,6 +734,160 @@ def disassemble(data, arch, off, size, va=0, count=400):
     return "\n".join(lines) if lines else "(no instructions decoded)"
 
 
+# ---------------------------------------------------------------- Ghidra engine
+
+def _meipass_dir():
+    return getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+
+
+def _ghidra_script():
+    for base in (_meipass_dir(), os.path.dirname(os.path.abspath(__file__))):
+        p = os.path.join(base, "ghidra_scripts", "ExportDecompiled.java")
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+def find_ghidra():
+    cands = []
+    for env in ("GHIDRA_HOME", "GHIDRA_INSTALL_DIR", "GHIDRA_DIR"):
+        v = os.environ.get(env)
+        if v:
+            cands.append(v)
+    home = os.path.expanduser("~")
+    cands += glob.glob(os.path.join(home, "ghidra_*_PUBLIC"))
+    cands += glob.glob(os.path.join(home, "project", "ghidra_*_PUBLIC"))
+    cands += glob.glob(os.path.join(home, "ghidra", "ghidra_*_PUBLIC"))
+    local = os.environ.get("LOCALAPPDATA") or os.path.join(home, "AppData", "Local")
+    cands += glob.glob(os.path.join(local, "UniDecomp", "engines", "ghidra*"))
+    for c in cands:
+        if os.path.isfile(os.path.join(c, "support", "analyzeHeadless.bat")):
+            return c
+    return None
+
+
+def _jdk_version(java_home):
+    try:
+        jexe = os.path.join(java_home, "bin", "java.exe")
+        if not os.path.isfile(jexe):
+            jexe = "java"
+        out = subprocess.run([jexe, "-version"], capture_output=True, text=True, timeout=15)
+        m = __import__("re").search(r'version "(\d+)', out.stderr + out.stdout)
+        return int(m.group(1)) if m else 0
+    except Exception:
+        return 0
+
+
+def find_jdk21():
+    v = os.environ.get("JAVA_HOME")
+    if v and _jdk_version(v) >= 21:
+        return v
+    home = os.path.expanduser("~")
+    pats = [os.path.join(home, "jdk*"),
+            r"C:\Program Files\Eclipse Adoptium\jdk-*",
+            r"C:\Program Files\Amazon Corretto\jdk*",
+            r"C:\Program Files\Microsoft\jdk*",
+            r"C:\Program Files\Java\jdk*",
+            r"C:\Program Files\Zulu\zulu-*"]
+    for pat in pats:
+        for d in sorted(glob.glob(pat), reverse=True):
+            if _jdk_version(d) >= 21:
+                return d
+    return None
+
+
+def install_engine():
+    local = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    engdir = os.path.join(local, "UniDecomp", "engines")
+    os.makedirs(engdir, exist_ok=True)
+    print("[engine] fetching latest Ghidra release info...", file=sys.stderr)
+    try:
+        rel = json.loads(urllib.request.urlopen(
+            "https://api.github.com/repos/NationalSecurityAgency/ghidra/releases/latest",
+            timeout=30).read())
+    except Exception as e:
+        print(f"[engine] github api failed: {e}", file=sys.stderr)
+        return 1
+    asset = next((a for a in rel.get("assets", [])
+                  if a["name"].startswith("ghidra") and a["name"].endswith(".zip")), None)
+    if not asset:
+        print("[engine] no ghidra zip asset in latest release", file=sys.stderr)
+        return 1
+    zpath = os.path.join(engdir, asset["name"])
+    mb = asset.get("size", 0) // 1048576
+    print(f"[engine] downloading {asset['name']} (~{mb} MB)...", file=sys.stderr)
+    try:
+        req = urllib.request.Request(asset["browser_download_url"],
+                                     headers={"User-Agent": "unidecomp"})
+        with urllib.request.urlopen(req, timeout=60) as r, open(zpath, "wb") as f:
+            done = 0
+            while True:
+                chunk = r.read(1 << 20)
+                if not chunk:
+                    break
+                f.write(chunk)
+                done += len(chunk)
+                if done % (50 << 20) < (1 << 20):
+                    print(f"[engine] {done >> 20}/{mb} MB", file=sys.stderr)
+    except Exception as e:
+        print(f"[engine] download failed: {e}", file=sys.stderr)
+        return 1
+    print("[engine] extracting...", file=sys.stderr)
+    try:
+        with zipfile.ZipFile(zpath) as z:
+            z.extractall(engdir)
+    except Exception as e:
+        print(f"[engine] extract failed: {e}", file=sys.stderr)
+        return 1
+    try:
+        os.remove(zpath)
+    except OSError:
+        pass
+    print(f"[engine] installed Ghidra {rel.get('tag_name','')} -> {engdir}", file=sys.stderr)
+    if find_jdk21() is None:
+        print("[engine] NOTE: JDK 21+ required — install Temurin JDK 21 "
+              "(https://adoptium.net) and set JAVA_HOME", file=sys.stderr)
+    return 0
+
+
+def decompile_ghidra(path, out_path=None, timeout=None):
+    ghidra = find_ghidra()
+    if not ghidra:
+        return None, ("ghidra not found — install it with: "
+                      "unidecomp <anyfile> --install-engine")
+    jdk = find_jdk21()
+    if not jdk:
+        return None, ("JDK 21+ not found — install Temurin JDK 21 and set JAVA_HOME")
+    script = _ghidra_script()
+    if not script:
+        return None, "ExportDecompiled.java script missing from install"
+    src = os.path.abspath(path)
+    projdir = tempfile.mkdtemp(prefix="unidecomp_")
+    out = os.path.abspath(out_path or (os.path.splitext(src)[0] + ".decompiled.c"))
+    bat = os.path.join(ghidra, "support", "analyzeHeadless.bat")
+    cmd = [bat, projdir, "proj", "-import", src,
+           "-scriptPath", os.path.dirname(script),
+           "-postScript", os.path.basename(script), out,
+           "-deleteProject"]
+    env = dict(os.environ)
+    env["JAVA_HOME"] = jdk
+    env["PATH"] = os.path.join(jdk, "bin") + os.pathsep + env.get("PATH", "")
+    print(f"[ghidra] headless analysis of {os.path.basename(src)} ...", file=sys.stderr)
+    print("[ghidra] large binaries take a LONG time (144MB Roblox exe: hours)",
+          file=sys.stderr)
+    try:
+        r = subprocess.run(cmd, env=env, capture_output=True, text=True,
+                           timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return None, "ghidra timed out"
+    tail = ((r.stdout or "") + (r.stderr or ""))[-3000:]
+    if tail.strip():
+        print(tail, file=sys.stderr)
+    if os.path.isfile(out) and os.path.getsize(out) > 0:
+        return out, None
+    return None, f"ghidra failed (exit {r.returncode})"
+
+
 # ---------------------------------------------------------------- top-level
 
 def analyze(path):
@@ -883,7 +1037,7 @@ def batch_scan(directory):
 def main():
     ap = argparse.ArgumentParser(prog="unidecomp",
                                  description="Universal binary analysis & decompilation workbench")
-    ap.add_argument("file", help="file to analyze (or directory with --batch)")
+    ap.add_argument("file", nargs="?", help="file to analyze (or directory with --batch)")
     ap.add_argument("--strings", action="store_true", help="extract strings only")
     ap.add_argument("--disasm", action="store_true", help="disassemble code section")
     ap.add_argument("--va", type=lambda x: int(x, 0), default=None, help="virtual address override")
@@ -895,9 +1049,19 @@ def main():
     ap.add_argument("--hash", action="store_true", help="hashes only")
     ap.add_argument("--carve", action="store_true", help="scan for embedded files")
     ap.add_argument("--batch", action="store_true", help="scan a directory recursively")
+    ap.add_argument("--decompile", action="store_true",
+                    help="full decompile via Ghidra headless -> .c file")
+    ap.add_argument("--install-engine", action="store_true",
+                    help="download Ghidra (Apache-2.0) into the engines dir")
     ap.add_argument("--out", "-o", default=None, help="write report to file")
     ap.add_argument("--json", action="store_true", help="JSON output")
     args = ap.parse_args()
+
+    if args.install_engine:
+        sys.exit(install_engine())
+
+    if not args.file:
+        ap.error("a file argument is required")
 
     if args.batch:
         if not os.path.isdir(args.file):
@@ -909,6 +1073,15 @@ def main():
     if not os.path.isfile(args.file):
         print(f"error: {args.file} not found", file=sys.stderr)
         sys.exit(1)
+
+    if args.decompile:
+        out, err = decompile_ghidra(args.file, args.out)
+        if err:
+            print(f"error: {err}", file=sys.stderr)
+            sys.exit(1)
+        print(f"decompiled -> {out}")
+        return
+
     data, info = analyze(args.file)
 
     if args.json:
